@@ -59,7 +59,7 @@ suites:
 ## Configuration Options
 
 | Option | Default | Description |
-|--------|---------|-------------|
+| -------- | --------- | ------------- |
 | `use_ssm_session_manager` | `false` | Enable SSM Session Manager transport |
 | `ssm_session_manager_document_name` | `nil` | Optional custom SSM document name |
 | `iam_profile_name` | `nil` | IAM instance profile (required for SSM) |
