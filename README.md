@@ -194,6 +194,8 @@ at `transport.username`.
 | `private_ip_address` | `nil` | Specific private IP to assign. |
 | `interface` | *auto* | Which address to connect to: `dns`, `public`, `private`, or `private_dns`. |
 | `elastic_network_interface_id` | `nil` | ID of an existing ENI to attach after creation. |
+| `network_interface_count` | `nil` | Number of network interfaces to create at launch, rather than attaching an existing one after creation. Additional interfaces inherit the primary interface's subnet and security groups, with no public IP. |
+| `network_interfaces` | `nil` | Array of override hashes, one per interface beyond the primary, for cases `network_interface_count` can't cover (e.g. a specific subnet or private IP per interface). Overrides `network_interface_count` when both are set. |
 
 ### SSH key
 
@@ -301,6 +303,30 @@ driver:
   security_group_ids:
     - sg-0abcdef1234567890
   associate_public_ip: true
+```
+
+### Launching with a second network interface
+
+A second interface, in the same subnet and security groups as the primary
+one, with no public IP:
+
+```yaml
+driver:
+  name: ec2
+  region: us-west-2
+  network_interface_count: 2
+```
+
+For a second interface in a specific subnet, or with its own private IP,
+override just that one interface instead:
+
+```yaml
+driver:
+  name: ec2
+  region: us-west-2
+  network_interfaces:
+    - subnet_id: subnet-0abcdef1234567890
+      private_ip_address: 10.0.2.5
 ```
 
 ### Finding the subnet by tag instead of naming it

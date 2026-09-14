@@ -77,6 +77,8 @@ module Kitchen
         end
       end
       default_config :private_ip_address, nil
+      default_config :network_interface_count, nil
+      default_config :network_interfaces, nil
       default_config :iam_profile_name,   nil
       default_config :spot_price,         nil
       default_config :block_duration_minutes, nil
