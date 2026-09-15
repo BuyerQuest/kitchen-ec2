@@ -196,6 +196,7 @@ at `transport.username`.
 | `elastic_network_interface_id` | `nil` | ID of an existing ENI to attach after creation. |
 | `network_interface_count` | `nil` | Number of network interfaces to create at launch, rather than attaching an existing one after creation. Additional interfaces inherit the primary interface's subnet and security groups, with no public IP. |
 | `network_interfaces` | `nil` | Array of override hashes, one per interface beyond the primary, for cases `network_interface_count` can't cover (e.g. a specific subnet or private IP per interface). Overrides `network_interface_count` when both are set. |
+| `elastic_ip` | `false` | At the top level, names the primary interface's Elastic IP; inside a `network_interfaces` entry, that interface's own. `true` allocates and releases one for you; a String (allocation ID or public IP) associates an existing one and leaves it alone on destroy. Never inherited by an interface that did not ask for one. AWS will not auto-assign a public IP (`associate_public_ip`) to any interface once more than one is present, so this is how a multi-interface instance gets one at all. |
 
 ### SSH key
 
@@ -327,6 +328,42 @@ driver:
   network_interfaces:
     - subnet_id: subnet-0abcdef1234567890
       private_ip_address: 10.0.2.5
+```
+
+A second interface means AWS will not auto-assign a public IP to either one
+(see `associate_public_ip` above), so if the transport needs to reach the
+instance and the subnet has no NAT/VPN path out, the primary interface needs
+an Elastic IP instead:
+
+```yaml
+driver:
+  name: ec2
+  region: us-west-2
+  elastic_ip: true
+  network_interface_count: 2
+```
+
+That allocates a fresh address and releases it again on destroy. To reuse a
+specific, already-allocated address instead -- and leave it alone when the
+instance is destroyed -- name it directly, by allocation ID or public IP:
+
+```yaml
+driver:
+  name: ec2
+  region: us-west-2
+  elastic_ip: eipalloc-0123456789abcdef0
+  network_interface_count: 2
+```
+
+`elastic_ip` works the same way inside a `network_interfaces` entry, to put
+the address on an additional interface instead of the primary one:
+
+```yaml
+driver:
+  name: ec2
+  region: us-west-2
+  network_interfaces:
+    - elastic_ip: true
 ```
 
 ### Finding the subnet by tag instead of naming it

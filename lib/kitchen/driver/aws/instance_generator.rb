@@ -189,7 +189,11 @@ module Kitchen
               i[:network_interfaces][0][:ipv_6_address_count] = 1
             end
             additional_interfaces.each_with_index do |overrides, offset|
-              i[:network_interfaces] << default_network_interface(offset + 1).merge(overrides)
+              # `elastic_ip` is a driver-only setting consumed after launch by
+              # `Ec2#associate_elastic_ips`, not a field `NetworkInterfaces`
+              # accepts -- RunInstances rejects the request outright if it is
+              # merged in here.
+              i[:network_interfaces] << default_network_interface(offset + 1).merge(overrides.except(:elastic_ip))
             end
           end
           # A bare zone letter is a shorthand for that zone within the

@@ -72,6 +72,19 @@ RSpec.describe Kitchen::Driver::Aws::InstanceGenerator do
       expect { run_instances }.not_to raise_error
     end
 
+    # elastic_ip is a driver-only setting consumed after launch by
+    # Ec2#associate_elastic_ips; RunInstances has no such field. A prior
+    # version of default_network_interface's override merge let it leak
+    # straight into the interface entry, and every `network_interfaces`
+    # config naming one died with
+    # "unexpected value at params[:network_interfaces][1][:elastic_ip]".
+    it "is accepted with an elastic_ip override on a second network interface" do
+      config[:subnet_id] = "subnet-0123456789abcdef0"
+      config[:network_interfaces] = [{ elastic_ip: true }]
+
+      expect { run_instances }.not_to raise_error
+    end
+
     it "is accepted with tags, block devices and metadata options" do
       config[:tags] = { "created-by" => "test-kitchen" }
       config[:block_device_mappings] = [{ device_name: "/dev/sda1", ebs: { volume_size: 30 } }]
@@ -422,6 +435,15 @@ RSpec.describe Kitchen::Driver::Aws::InstanceGenerator do
         it "creates one additional interface per array entry" do
           config[:network_interfaces] = [{}, {}]
           expect(instance_data[:network_interfaces].length).to eq(3)
+        end
+
+        # elastic_ip is consumed after launch by Ec2#associate_elastic_ips, not
+        # a field NetworkInterfaces accepts -- RunInstances rejects the whole
+        # request if it is merged into the interface entry.
+        it "does not leak an elastic_ip override into the interface entry" do
+          config[:network_interfaces] = [{ elastic_ip: true }]
+
+          expect(instance_data[:network_interfaces][1]).not_to have_key(:elastic_ip)
         end
       end
 
