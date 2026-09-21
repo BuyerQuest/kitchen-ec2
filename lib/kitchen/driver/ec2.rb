@@ -77,6 +77,9 @@ module Kitchen
         end
       end
       default_config :private_ip_address, nil
+      default_config :network_interface_count, nil
+      default_config :network_interfaces, nil
+      default_config :elastic_ip, false
       default_config :iam_profile_name,   nil
       default_config :spot_price,         nil
       default_config :block_duration_minutes, nil
@@ -407,6 +410,8 @@ module Kitchen
 
         info("EC2 instance <#{state[:server_id]}> ready (hostname: #{state[:hostname]}).")
 
+        refresh_hostname_after_elastic_ip(state) if associate_elastic_ips(state)
+
         if config[:use_instance_connect]
           instance_connect_setup_ready(state)
         elsif config[:use_ssm_session_manager]
@@ -501,16 +506,19 @@ module Kitchen
               warn("Received #{e}, instance was probably already destroyed. Ignoring")
             end
           end
-          # Two cleanups below cannot succeed while the instance is still
-          # shutting down, so either of them means waiting termination out:
-          # an auto-created security group cannot be deleted while an instance
-          # still references it, and a dedicated host goes on listing a
-          # terminating instance, which blocks its release.
+          # None of the cleanups below can succeed while the instance is
+          # still shutting down, so any of them means waiting termination
+          # out: an auto-created security group cannot be deleted while an
+          # instance still references it, a dedicated host goes on listing a
+          # terminating instance which blocks its release, and a driver-owned
+          # Elastic IP cannot be released while its association -- torn down
+          # as the instance's network interfaces are deleted -- still exists.
           #
           # The host case used to be missing, so a run that supplied its own
           # `security_group_ids` skipped the wait, found the host still
           # occupied, and silently left it allocated and billing.
-          if (state[:auto_security_group_id] || state[:allocated_host_id]) &&
+          if (state[:auto_security_group_id] || state[:allocated_host_id] ||
+              !Array(state[:auto_elastic_ip_allocation_ids]).empty?) &&
               server && ec2.instance_exists?(state[:server_id])
             wait_log = proc do |attempts|
               c = attempts * config[:retryable_sleep]
@@ -528,9 +536,10 @@ module Kitchen
           state.delete(:hostname)
         end
 
-        # Clean up any auto-created security groups or keys.
+        # Clean up any auto-created security groups, keys, or Elastic IPs.
         delete_security_group(state)
         delete_key(state)
+        release_elastic_ips(state)
 
         # Release the dedicated host this instance's create allocated, if it
         # allocated one and nothing else is left running on it.
@@ -1440,6 +1449,146 @@ module Kitchen
             puts "ENI #{config[:elastic_network_interface_id]} already attached."
           end
         rescue ::Aws::EC2::Errors::InvalidNetworkInterfaceIDNotFound => e
+          warn(e)
+        end
+      end
+
+      # Resolve an `elastic_ip` config value naming an already-existing
+      # address to that address.
+      #
+      # Accepts an allocation ID (`eipalloc-...`) or a bare public IP
+      # address, either of which uniquely identifies one Elastic IP.
+      #
+      # @api private
+      # @param value [String] an allocation ID or public IP address
+      # @return [Aws::EC2::Types::Address]
+      # @raise [Kitchen::UserError] when no matching address exists
+      def find_elastic_ip(value)
+        addresses = if value.start_with?("eipalloc-")
+                      ec2.client.describe_addresses(allocation_ids: [value]).addresses
+                    else
+                      ec2.client.describe_addresses(public_ips: [value]).addresses
+                    end
+        return addresses.first unless addresses.empty?
+
+        raise Kitchen::UserError, "elastic_ip #{value.inspect} does not match any existing Elastic IP"
+      rescue ::Aws::EC2::Errors::InvalidAddressNotFound, ::Aws::EC2::Errors::InvalidAllocationIDNotFound
+        raise Kitchen::UserError, "elastic_ip #{value.inspect} does not match any existing Elastic IP"
+      end
+
+      # Allocate a new Elastic IP, tagged the same way every other resource
+      # this driver creates on a caller's behalf is tagged.
+      #
+      # @api private
+      # @return [String] the new allocation ID
+      def allocate_elastic_ip
+        ec2.client.allocate_address(
+          domain: "vpc",
+          tag_specifications: [
+            {
+              resource_type: "elastic-ip",
+              tags: [
+                {
+                  key: "created-by",
+                  value: "test-kitchen",
+                },
+              ],
+            },
+          ]
+        ).allocation_id
+      end
+
+      # Associate Elastic IPs onto whichever interfaces asked for one.
+      #
+      # `elastic_ip` at the top level names the primary interface's (device
+      # index 0) address; each `network_interfaces` entry may set its own
+      # `elastic_ip` for that specific additional interface. Neither setting
+      # is ever inherited by an interface that did not ask for one itself,
+      # for the same reason a second interface never inherits
+      # `associate_public_ip_address` in
+      # {Kitchen::Driver::Aws::InstanceGenerator#default_network_interface}: a
+      # NIC should never silently end up internet-facing.
+      #
+      # `true` allocates a fresh, driver-owned Elastic IP that
+      # {#release_elastic_ips} will release on destroy. A String looks up an
+      # existing Elastic IP by allocation ID or public IP address and
+      # associates it without taking ownership of it -- destroy leaves it
+      # exactly as it was found, still allocated and available for the next
+      # run to reuse. `false` or unset does nothing.
+      #
+      # @param state [Hash] the instance state, updated in place with
+      #   `:auto_elastic_ip_allocation_ids` for any newly-allocated addresses
+      # @return [void]
+      def associate_elastic_ips(state)
+        requests = [[0, config[:elastic_ip]]] + Array(config[:network_interfaces]).each_with_index.map do |overrides, i|
+          [i + 1, overrides[:elastic_ip]]
+        end
+        requests = requests.reject { |_device_index, value| value.nil? || value == false }
+        return if requests.empty?
+
+        network_interface_ids_by_device_index =
+          ec2.client.describe_instances(instance_ids: [state[:server_id]])
+            .reservations.first.instances.first.network_interfaces
+            .to_h { |eni| [eni.attachment.device_index, eni.network_interface_id] }
+
+        requests.each do |device_index, value|
+          network_interface_id = network_interface_ids_by_device_index[device_index]
+          next unless network_interface_id
+
+          allocation_id =
+            if value == true
+              allocate_elastic_ip.tap { |id| (state[:auto_elastic_ip_allocation_ids] ||= []) << id }
+            else
+              find_elastic_ip(value).allocation_id
+            end
+
+          info("Associating Elastic IP allocation <#{allocation_id}> with network interface " \
+               "<#{network_interface_id}> (device index #{device_index}).")
+          ec2.client.associate_address(allocation_id:, network_interface_id:)
+        end
+      end
+
+      # Re-resolve `state[:hostname]` after Elastic IPs are associated.
+      #
+      # `wait_until_ready` caches the hostname before {#associate_elastic_ips}
+      # ever runs, so whenever the primary interface's only route to a public
+      # address is a freshly associated `elastic_ip`, that cached value is
+      # already stale by the time it is stored -- usually the private
+      # address, since that is what a multi-interface instance with no public
+      # IP resolves to. Left uncorrected, the transport spends the rest of
+      # `create` trying to reach an address nothing routes to from outside
+      # the VPC.
+      #
+      # @api private
+      # @param state [Hash] the instance state, updated in place
+      # @return [void]
+      def refresh_hostname_after_elastic_ip(state)
+        aws_instance = ec2.get_instance(state[:server_id])
+        resolved = hostname(aws_instance, config[:interface])
+        resolved = hostname(aws_instance, nil) if resolved.nil? || resolved == ""
+        state[:hostname] = resolved
+        info("EC2 instance <#{state[:server_id]}> hostname updated to #{state[:hostname]} " \
+             "after associating an Elastic IP.")
+      end
+
+      # Release every Elastic IP this instance's create allocated.
+      #
+      # An address looked up by allocation ID or public IP string was never
+      # this driver's to destroy, and {#associate_elastic_ips} never records
+      # it here -- it is left associated-or-not exactly as it was handed
+      # over.
+      #
+      # @api private
+      # @param state [Hash] Instance state hash.
+      # @return [void]
+      def release_elastic_ips(state)
+        allocation_ids = state.delete(:auto_elastic_ip_allocation_ids)
+        return if allocation_ids.nil? || allocation_ids.empty?
+
+        allocation_ids.each do |allocation_id|
+          info("Releasing automatic Elastic IP #{allocation_id}")
+          ec2.client.release_address(allocation_id:)
+        rescue ::Aws::EC2::Errors::InvalidAllocationIDNotFound => e
           warn(e)
         end
       end
